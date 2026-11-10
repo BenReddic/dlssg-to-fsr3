@@ -1,5 +1,6 @@
 #include <d3d12.h>
 #include <dxgi.h>
+#include "NativeFramePacer.h"
 #include "FFFrameInterpolatorDX.h"
 #include "NvNGX.h"
 
@@ -82,6 +83,9 @@ NGXDLLEXPORT NGXResult NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList
 	if (!instance)
 		return NGX_FEATURE_NOT_FOUND;
 
+	// Pace native-frame evaluation before FSR3 interpolation dispatch.
+	// This is NOT a game-loop-start hook; it may add render-thread wait time.
+	NativeFramePacer::WaitBeforeEvaluation();
 	const auto status = instance->Dispatch(CommandList, Parameters);
 
 	switch (status)
