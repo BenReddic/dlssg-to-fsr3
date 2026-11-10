@@ -1,0 +1,81 @@
+name: Build MSFS native FPS pacer (Windows x64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out patched Nukem repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check patch and source prerequisites
+        run: |
+          $required = @('CMakePresets.json', 'source/maindll/NGX/NativeFramePacer.h', 'source/maindll/NGX/NvNGXDirectX12.cpp', 'dependencies/FidelityFX-SDK/sdk/BuildFidelityFXSDK.bat')
+          foreach ($p in $required) { if (!(Test-Path $p)) { throw "Missing $p. Fork the original Nukem repo, then upload the patch files preserving their paths." } }
+          if (!(Select-String -Path 'source/maindll/NGX/NvNGXDirectX12.cpp' -Pattern 'NativeFramePacer' -Quiet)) { throw 'NvNGXDirectX12.cpp does not contain the pacer patch.' }
+          cmake --version
+
+      - name: Install Vulkan SDK on GitHub runner
+        run: |
+          choco install vulkan-sdk -y --no-progress --limit-output
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey Vulkan SDK installation failed. See logs.' }
+          $sdk = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+          if (!$sdk) { throw 'Vulkan SDK was not found under C:\VulkanSDK' }
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Prepare vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build FidelityFX SDK DX12 and Vulkan
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          call dependencies\Build-FFX-SDK.bat
+          if errorlevel 1 exit /b 1
+
+      - name: Configure Universal x64 Release
+        run: |
+          cmake --preset final-universal
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+
+      - name: Build Universal x64 Release
+        run: |
+          cmake --build --preset final-universal-release --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+
+      - name: Package compiled DLL and config
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          $dll = Get-ChildItem bin -Recurse -File -Filter 'dlssg_to_fsr3_amd_is_better.dll' | Where-Object { $_.FullName -match 'Release' } | Select-Object -First 1
+          if (!$dll) { $dll = Get-ChildItem bin -Recurse -File -Filter 'dlssg_to_fsr3_amd_is_better.dll' | Select-Object -First 1 }
+          if (!$dll) { throw 'Main DLL not found; inspect build output.' }
+          Copy-Item $dll.FullName package/
+          Copy-Item NativeFramePacer.ini package/
+          $wrappers = Get-ChildItem bin -Recurse -File -Filter 'version.dll' | Where-Object { $_.FullName -match 'Release' }
+          if ($wrappers) { Copy-Item $wrappers[0].FullName package/ }
+          Get-ChildItem package | Select-Object Name,Length
+
+      - name: Upload portable Windows DLL package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MSFS-Native-Pacer-29_973-Windows-x64
+          path: package/*
+          if-no-files-found: error
+          retention-days: 14
