@@ -29,13 +29,20 @@ jobs:
             'vcpkg.json',
             'source/maindll/NGX/NativeFramePacer.h',
             'source/maindll/NGX/NvNGXDirectX12.cpp',
-            'dependencies/FidelityFX-SDK/sdk/BuildFidelityFXSDK.bat'
+            'dependencies/FidelityFX-SDK/sdk/CMakeLists.txt',
+            'NativeFramePacer.ini'
           )
+
           foreach ($p in $required) {
-            if (!(Test-Path $p)) { throw "Missing: $p" }
+            if (!(Test-Path $p)) {
+              throw "Missing required file: $p"
+            }
           }
-          if (!(Select-String -Path 'source/maindll/NGX/NvNGXDirectX12.cpp' -Pattern 'NativeFramePacer' -Quiet)) {
-            throw 'Pacer patch not found in NvNGXDirectX12.cpp'
+
+          if (!(Select-String `
+            -Path 'source/maindll/NGX/NvNGXDirectX12.cpp' `
+            -Pattern 'NativeFramePacer' -Quiet)) {
+            throw 'Native FPS limiter patch not found'
           }
 
       - name: Set up MSVC compiler
@@ -43,28 +50,40 @@ jobs:
         with:
           arch: x64
 
-      - name: Install Ninja on GitHub runner
+      - name: Install Ninja
         run: |
           choco install ninja -y --no-progress --limit-output
-          if ($LASTEXITCODE -ne 0) { throw 'Ninja installation failed' }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Ninja installation failed'
+          }
 
       - name: Verify build tools
         run: |
           cmake --version
           ninja --version
           where.exe cl
-          if ($LASTEXITCODE -ne 0) { throw 'MSVC compiler not found' }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'MSVC compiler not found'
+          }
 
       - name: Install Vulkan SDK
         run: |
           choco install vulkan-sdk -y --no-progress --limit-output
-          if ($LASTEXITCODE -ne 0) { throw 'Vulkan SDK installation failed' }
 
-          $sdk = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Vulkan SDK installation failed'
+          }
+
+          $sdk = Get-ChildItem 'C:\VulkanSDK' `
+            -Directory -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending |
             Select-Object -First 1
 
-          if (!$sdk) { throw 'Vulkan SDK not found' }
+          if (!$sdk) {
+            throw 'Vulkan SDK not found'
+          }
 
           "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
           "$($sdk.FullName)\Bin" >> $env:GITHUB_PATH
@@ -72,74 +91,174 @@ jobs:
       - name: Prepare vcpkg with full Git history
         run: |
           $root = Join-Path $env:RUNNER_TEMP 'vcpkg'
-          git clone https://github.com/microsoft/vcpkg.git $root
-          if ($LASTEXITCODE -ne 0) { throw 'vcpkg clone failed' }
 
-          $manifest = Get-Content vcpkg.json -Raw | ConvertFrom-Json
+          git clone https://github.com/microsoft/vcpkg.git $root
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'vcpkg clone failed'
+          }
+
+          $manifest = Get-Content vcpkg.json -Raw |
+            ConvertFrom-Json
+
           $baseline = $manifest.'builtin-baseline'
 
           git -C $root cat-file -e "${baseline}:versions/baseline.json"
+
           if ($LASTEXITCODE -ne 0) {
             git -C $root fetch origin $baseline
+
             if ($LASTEXITCODE -ne 0) {
-              throw "Required vcpkg baseline $baseline unavailable"
+              throw "Required vcpkg baseline unavailable: $baseline"
             }
+
             git -C $root cat-file -e "${baseline}:versions/baseline.json"
+
             if ($LASTEXITCODE -ne 0) {
-              throw "Baseline $baseline does not contain versions/baseline.json"
+              throw "Invalid vcpkg baseline: $baseline"
             }
           }
 
           & "$root\bootstrap-vcpkg.bat" -disableMetrics
-          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'vcpkg bootstrap failed'
+          }
 
           "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
 
-      - name: Build FidelityFX SDK
-        shell: cmd
+      - name: Build FidelityFX SDK DX12
         run: |
-          cd dependencies\FidelityFX-SDK\sdk
-          call BuildFidelityFXSDK.bat -DFFX_API_BACKEND=DX12_X64 -DFFX_FI=ON -DFFX_OF=ON -DFFX_AUTO_COMPILE_SHADERS=1
-          if errorlevel 1 exit /b 1
-          call BuildFidelityFXSDK.bat -DFFX_API_BACKEND=VK_X64 -DFFX_FI=ON -DFFX_OF=ON -DFFX_AUTO_COMPILE_SHADERS=1
-          if errorlevel 1 exit /b 1
+          $sdk = 'dependencies/FidelityFX-SDK/sdk'
+          $build = "$sdk/build-gh-dx12"
+
+          cmake -S $sdk -B $build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DFFX_API_BACKEND=DX12_X64 `
+            -DFFX_FI=ON `
+            -DFFX_OF=ON `
+            -DFFX_AUTO_COMPILE_SHADERS=ON
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'FidelityFX DX12 configuration failed'
+          }
+
+          cmake --build $build --config Release --parallel 4
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'FidelityFX DX12 compilation failed'
+          }
+
+      - name: Build FidelityFX SDK Vulkan
+        run: |
+          $sdk = 'dependencies/FidelityFX-SDK/sdk'
+          $build = "$sdk/build-gh-vk"
+
+          cmake -S $sdk -B $build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DFFX_API_BACKEND=VK_X64 `
+            -DFFX_FI=ON `
+            -DFFX_OF=ON `
+            -DFFX_AUTO_COMPILE_SHADERS=ON
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'FidelityFX Vulkan configuration failed'
+          }
+
+          cmake --build $build --config Release --parallel 4
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'FidelityFX Vulkan compilation failed'
+          }
+
+      - name: Locate FidelityFX libraries
+        run: |
+          $sdk = 'dependencies/FidelityFX-SDK/sdk'
+
+          $required = @(
+            'ffx_backend_dx12_x64.lib',
+            'ffx_backend_vk_x64.lib',
+            'ffx_frameinterpolation_x64.lib',
+            'ffx_opticalflow_x64.lib'
+          )
+
+          $destination = Join-Path $sdk 'bin/ffx_sdk'
+
+          New-Item -ItemType Directory -Force `
+            -Path $destination | Out-Null
+
+          foreach ($name in $required) {
+            $found = Get-ChildItem $sdk -Recurse -File `
+              -Filter $name |
+              Where-Object {
+                $_.FullName -match 'Release|bin/ffx_sdk|bin\\ffx_sdk'
+              } |
+              Select-Object -First 1
+
+            if (!$found) {
+              Write-Host "Available FidelityFX libraries:"
+              Get-ChildItem $sdk -Recurse -File -Filter '*.lib' |
+                Select-Object -ExpandProperty FullName
+
+              throw "Missing FidelityFX library: $name"
+            }
+
+            $target = Join-Path $destination $name
+
+            if ($found.FullName -ne $target) {
+              Copy-Item $found.FullName $target -Force
+            }
+
+            Write-Host "FOUND: $target"
+          }
 
       - name: Configure Universal x64 Release
         run: |
           cmake --preset final-universal
-          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'CMake configuration failed'
+          }
 
       - name: Build Universal x64 Release
         run: |
           cmake --build --preset final-universal-release --parallel 4
-          if ($LASTEXITCODE -ne 0) { throw 'Compilation failed' }
 
-      - name: Package DLL and limiter config
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Main DLL compilation failed'
+          }
+
+      - name: Package compiled DLL and limiter configuration
         run: |
-          New-Item -ItemType Directory -Force package | Out-Null
+          New-Item -ItemType Directory -Force `
+            -Path package | Out-Null
 
-          $dll = Get-ChildItem 'bin/final-universal' -Recurse -File -Filter 'dlssg_to_fsr3_amd_is_better.dll' |
+          $dll = Get-ChildItem 'bin/final-universal' `
+            -Recurse -File `
+            -Filter 'dlssg_to_fsr3_amd_is_better.dll' |
             Where-Object { $_.FullName -match 'Release' } |
             Select-Object -First 1
 
-          if (!$dll) { throw 'Compiled main DLL not found' }
+          if (!$dll) {
+            throw 'Compiled Nukem main DLL not found'
+          }
 
           Copy-Item $dll.FullName package/
-
-          if (!(Test-Path 'NativeFramePacer.ini')) {
-            throw 'NativeFramePacer.ini missing from repository root'
-          }
           Copy-Item NativeFramePacer.ini package/
 
-          $wrapper = Get-ChildItem 'bin/final-universal' -Recurse -File -Filter 'version.dll' |
+          $wrapper = Get-ChildItem 'bin/final-universal' `
+            -Recurse -File -Filter 'version.dll' |
             Where-Object { $_.FullName -match 'Release' } |
             Select-Object -First 1
 
-          if ($wrapper) { Copy-Item $wrapper.FullName package/ }
+          if ($wrapper) {
+            Copy-Item $wrapper.FullName package/
+          }
 
-          Get-ChildItem package | Select-Object Name,Length
+          Get-ChildItem package |
+            Select-Object Name, Length
 
-      - name: Upload Windows DLL package
+      - name: Upload portable Windows DLL package
         uses: actions/upload-artifact@v4
         with:
           name: MSFS-Native-Pacer-29_973-Windows-x64
